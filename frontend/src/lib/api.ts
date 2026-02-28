@@ -48,6 +48,9 @@ export interface Wishlist {
   deadline?: string;
   is_archived: boolean;
   public_slug?: string;
+  owner_id: number;
+  owner_username?: string;
+  owner_email?: string;
   gifts: Gift[];
   total_value: number;
   total_collected: number;
