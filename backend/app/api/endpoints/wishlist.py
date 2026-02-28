@@ -80,7 +80,7 @@ async def get_browser_page(playwright):
     )
     context = await browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        viewport={'width': 1920, 'height': 1080}
+        viewport={'width': 1280, 'height': 720}
     )
     page = await context.new_page()
     await stealth_async(page)
@@ -90,7 +90,7 @@ async def get_browser_page(playwright):
 async def scrape_url(url: str):
     clean_url = url.split('?')[0] if '?' in url else url
     
-    # 1. МАГИЯ ДЛЯ WILDBERRIES (Через API, без браузера - 100% успех)
+    # WB API - 100% SUCCESS
     if "wildberries.ru" in clean_url:
         try:
             wb_id = re.search(r'catalog/(\d+)/', clean_url)
@@ -101,98 +101,64 @@ async def scrape_url(url: str):
                     resp = await client.get(api_url)
                     data = resp.json()
                     product = data['data']['products'][0]
-                    
-                    # Формируем URL картинки (WB использует хитрую схему)
                     vol = int(product_id) // 100000
                     part = int(product_id) // 1000
-                    # Обычно это basket-01...15, попробуем угадать или использовать заглушку
-                    # Но для простоты возьмем готовую схему
                     img_url = f"https://basket-10.wbbasket.ru/vol{vol}/part{part}/{product_id}/images/big/1.webp"
-                    
-                    return {
-                        "title": product['name'],
-                        "price": float(product['salePriceU'] // 100),
-                        "image_url": img_url,
-                        "url": clean_url,
-                        "success": True
-                    }
-        except Exception as e:
-            print(f"WB API failed: {e}")
+                    return {"title": product['name'], "price": float(product['salePriceU'] // 100), "image_url": img_url, "url": clean_url, "success": True}
+        except: pass
 
-    # 2. МАГИЯ ДЛЯ OZON (Через Playwright с глубокой маскировкой)
+    # OZON / OTHER - HYBRID SCRAPING
     try:
         async with async_playwright() as p:
             browser = None
             try:
                 browser, page = await get_browser_page(p)
-                # Ozon любит, когда мы сначала заходим на главную
-                if "ozon.ru" in clean_url:
-                    await page.goto("https://www.ozon.ru", wait_until="commit", timeout=20000)
-                    await asyncio.sleep(2)
-                
                 await page.goto(clean_url, wait_until="commit", timeout=45000)
                 
-                # Ждем либо товар, либо даже если капча - пробуем выдрать из заголовка
-                try:
-                    await page.wait_for_selector("h1, [data-widget='webPrice']", timeout=15000)
-                except: pass
+                # Ждем чуть-чуть для первичного рендера
+                await asyncio.sleep(2)
                 
-                # Прокрутка для ленивой загрузки
-                await page.mouse.wheel(0, 500)
-                await asyncio.sleep(3)
-                
-                data = await page.evaluate("""() => {
+                # Пытаемся вытащить данные через заголовок и метатеги (самый надежный способ для Ozon)
+                content_data = await page.evaluate("""() => {
                     const getMeta = (name) => document.querySelector(`meta[property="${name}"], meta[name="${name}"]`)?.content;
                     const title = document.querySelector('h1')?.innerText || document.title;
-                    const priceMeta = getMeta('og:price:amount') || getMeta('product:price:amount');
+                    const priceMeta = getMeta('og:price:amount') || getMeta('product:price:amount') || getMeta('price');
+                    const imgMeta = getMeta('og:image') || getMeta('twitter:image');
                     
-                    let priceRaw = priceMeta || "";
-                    if (!priceRaw) {
-                        const pEl = document.querySelector("[data-widget='webPrice'], [data-widget='pdpPrice'], .price-block__final-price");
-                        if (pEl) priceRaw = pEl.innerText;
-                    }
-                    
-                    let image = getMeta('og:image') || "";
-                    if (image.includes('logo') || !image) {
-                        const img = document.querySelector("img[src*='ozon'], img[src*='wbbasket']");
-                        if (img) image = img.src;
-                    }
-                    
-                    return { title, priceRaw, image, html: document.body.innerText.slice(0, 500) };
+                    return { title, priceMeta, imgMeta, html: document.documentElement.innerHTML.slice(0, 10000) };
                 }""")
                 
-                raw_title = data['title']
-                price_str = str(data['priceRaw'])
+                raw_title = content_data['title']
+                price_str = str(content_data['priceMeta'] or "0")
+                image = content_data['imgMeta'] or ""
                 
-                # Если в заголовке есть цена (Ozon часто пишет "Купить за 1234 руб")
-                if "купить за" in raw_title.lower() or "цена" in raw_title.lower():
+                # Если цена не в мета-тегах, ищем в тексте заголовка (Ozon часто пишет её там)
+                if price_str == "0":
                     price_match = re.search(r'(\d[\d\s\xa0]*)(?:руб|₽)', raw_title.lower())
                     if price_match: price_str = price_match.group(1)
+                
+                # Если всё ещё нет, пробуем Regex по всему HTML (ищем json-данные Ozon)
+                if price_str == "0":
+                    price_regex = re.search(r'"price":"(\d+)"', content_data['html'])
+                    if price_regex: price_str = price_regex.group(1)
 
                 price = 0
                 if price_str:
                     nums = re.sub(r'[^\d]', '', price_str.replace('\xa0', ''))
                     if nums: price = float(nums)
                 
+                # Чистка названия
                 clean_title = raw_title.split(' купить за')[0].split(' - купить')[0].split(' (')[0].strip()
-                if "challenge" in clean_title.lower() or "captcha" in clean_title.lower():
-                    clean_title = "Товар (нужно ввести название вручную)"
+                if "challenge" in clean_title.lower() or "captcha" in clean_title.lower() or len(clean_title) < 3:
+                    clean_title = "Товар из Ozon"
 
-                return {
-                    "title": clean_title if len(clean_title) > 5 else "Товар",
-                    "price": price,
-                    "image_url": data['image'],
-                    "url": clean_url,
-                    "success": price > 0
-                }
-            except Exception as e:
-                print(f"Scrape error: {e}")
-                return {"title": "Ошибка (введите вручную)", "price": 0, "image_url": "", "url": clean_url, "success": False}
+                return {"title": clean_title, "price": price, "image_url": image, "url": clean_url, "success": price > 0}
+            except: return {"title": "Ошибка", "price": 0, "image_url": "", "url": clean_url, "success": False}
             finally:
                 if browser: await browser.close()
-    except Exception as e:
-        return {"title": "Ошибка", "price": 0, "image_url": "", "url": clean_url, "success": False}
+    except: return {"title": "Ошибка", "price": 0, "image_url": "", "url": clean_url, "success": False}
 
+# Остальные эндпоинты без изменений...
 @router.post("/", response_model=WishlistResponse)
 async def create_wishlist(wishlist_data: WishlistCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     try:
