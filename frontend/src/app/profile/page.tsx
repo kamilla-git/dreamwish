@@ -73,7 +73,11 @@ export default function Profile() {
 
   const respondToRequest = async (id: number, accept: boolean) => {
     try {
-      await api.respondToFriendRequest(id, accept);
+      if (accept) {
+        await api.acceptFriendRequest(id);
+      } else {
+        await api.rejectFriendRequest(id);
+      }
       toast.success(accept ? 'Запрос принят' : 'Запрос отклонен');
       loadData();
     } catch (e) { toast.error('Ошибка ответа на запрос'); }
