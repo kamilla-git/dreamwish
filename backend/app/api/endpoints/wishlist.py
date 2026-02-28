@@ -193,7 +193,12 @@ async def get_friends_wishlists(db: AsyncSession = Depends(get_db), current_user
     return [await format_wishlist_response(w, db, current_user.id) for w in result.scalars().all()]
 
 @router.get("/public/{slug}", response_model=WishlistResponse)
-async def get_public_wishlist(slug: str, db: AsyncSession = Depends(get_db), authorization: Optional[str] = Header(None)):
+async def get_public_wishlist(
+    slug: str, 
+    db: AsyncSession = Depends(get_db), 
+    authorization: Optional[str] = Header(None)
+):
+    # Пытаемся определить пользователя
     current_user_id = None
     if authorization:
         try:
@@ -201,9 +206,29 @@ async def get_public_wishlist(slug: str, db: AsyncSession = Depends(get_db), aut
             user = await get_current_user_from_token(authorization, db)
             if user: current_user_id = user.id
         except: pass
+
     result = await db.execute(select(Wishlist).where(Wishlist.public_slug == slug))
     wishlist = result.scalar_one_or_none()
     if not wishlist: raise HTTPException(status_code=404, detail="Not found")
+    
+    # ПРОВЕРКА ПРИВАТНОСТИ
+    if wishlist.is_private:
+        if not current_user_id:
+            raise HTTPException(status_code=403, detail="Этот список приватный. Пожалуйста, войдите, чтобы просмотреть его.")
+        
+        # Если не владелец, проверяем дружбу
+        if wishlist.owner_id != current_user_id:
+            from ...models.wishlist import Friendship
+            f_query = select(Friendship).where(
+                or_(
+                    and_(Friendship.user_id == current_user_id, Friendship.friend_id == wishlist.owner_id, Friendship.status == "accepted"),
+                    and_(Friendship.user_id == wishlist.owner_id, Friendship.friend_id == current_user_id, Friendship.status == "accepted")
+                )
+            )
+            friendship = await db.execute(f_query)
+            if not friendship.scalar_one_or_none():
+                raise HTTPException(status_code=403, detail="Доступ запрещен. Вы должны быть в друзьях у владельца.")
+
     return await format_wishlist_response(wishlist, db, current_user_id)
 
 @router.get("/{wishlist_id}", response_model=WishlistResponse)
