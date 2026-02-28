@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 import shutil
 import os
@@ -42,36 +42,26 @@ async def upload_image(file: UploadFile = File(...)):
     return {"url": f"/uploads/{filename}"}
 
 async def format_wishlist_response(wishlist: Wishlist, db: AsyncSession, current_user_id: Optional[int] = None) -> WishlistResponse:
-    """Формирует ответ, скрывая статус резерва от владельца для сохранения сюрприза"""
     res_gifts = await db.execute(select(Gift).where(Gift.wishlist_id == wishlist.id))
     gifts = res_gifts.scalars().all()
-    
     is_owner = current_user_id == wishlist.owner_id
-    
     gift_responses = []
     total_val = 0
     total_col = 0
-    
     for g in gifts:
         total_val += g.price
         total_col += g.collected_amount
         progress = (g.collected_amount / g.price * 100) if g.price > 0 else 0
-        
-        # СТРОГОЕ СОБЛЮДЕНИЕ ТЗ: Если смотрит владелец — скрываем статус сюрприза
         gift_responses.append(GiftResponse(
-            id=g.id, 
-            title=g.title, 
-            url=g.url, 
-            price=g.price,
+            id=g.id, title=g.title, url=g.url, price=g.price,
             image_url=g.image_url, 
-            is_reserved=False if is_owner else g.is_reserved, # Маскировка
+            is_reserved=False if is_owner else g.is_reserved,
             is_received=getattr(g, 'is_received', False),
-            collected_amount=0.0 if is_owner else g.collected_amount, # Маскировка
+            collected_amount=0.0 if is_owner else g.collected_amount,
             wishlist_id=g.wishlist_id,
             created_at=g.created_at, 
-            progress_percentage=0.0 if is_owner else progress # Маскировка
+            progress_percentage=0.0 if is_owner else progress
         ))
-    
     owner_username = "Anonymous"
     owner_email = ""
     if wishlist.owner_id:
@@ -80,9 +70,7 @@ async def format_wishlist_response(wishlist: Wishlist, db: AsyncSession, current
         if owner:
             owner_username = owner.username
             owner_email = owner.email
-
     completion = (total_col / total_val * 100) if total_val > 0 else 0
-    
     return WishlistResponse(
         id=wishlist.id, title=wishlist.title, description=wishlist.description,
         theme=wishlist.theme, custom_theme_name=wishlist.custom_theme_name,
@@ -90,25 +78,49 @@ async def format_wishlist_response(wishlist: Wishlist, db: AsyncSession, current
         is_archived=wishlist.is_archived, is_private=getattr(wishlist, 'is_private', False),
         public_slug=wishlist.public_slug, owner_id=wishlist.owner_id,
         owner_username=owner_username, owner_email=owner_email,
-        gifts=gift_responses, 
-        total_value=total_val,
-        total_collected=0.0 if is_owner else total_col, # Маскировка
-        completion_percentage=0.0 if is_owner else completion # Маскировка
+        gifts=gift_responses, total_value=total_val,
+        total_collected=0.0 if is_owner else total_col,
+        completion_percentage=0.0 if is_owner else completion
     )
+
+async def get_browser_page(playwright):
+    browser = await playwright.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    )
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        viewport={'width': 1280, 'height': 720}
+    )
+    page = await context.new_page()
+    await stealth_async(page)
+    async def block_aggressively(route):
+        if route.request.resource_type in ["image", "media", "font"] and not ("wbbasket" in route.request.url or "ozone" in route.request.url):
+            await route.abort()
+        elif any(domain in route.request.url for domain in ["google-analytics", "yandex.ru", "doubleclick", "facebook"]):
+            await route.abort()
+        else:
+            await route.continue_()
+    await page.route("**/*", block_aggressively)
+    return browser, page
 
 @router.post("/scrape")
 async def scrape_url(url: str):
-    if not url.startswith("http"): return {"title": "", "price": 0, "image_url": "", "url": url, "success": False}
+    clean_url = url.split('?')[0] if '?' in url and ('ozon' in url or 'wildberries' in url) else url
+    if not clean_url.startswith("http"): return {"title": "", "price": 0, "image_url": "", "url": clean_url, "success": False}
     try:
         async with async_playwright() as p:
             browser = None
             try:
                 browser, page = await get_browser_page(p)
-                await page.goto(url, wait_until="commit", timeout=30000)
+                await page.goto(clean_url, wait_until="commit", timeout=45000)
+                page_title = await page.title()
+                if "captcha" in page_title.lower() or "robot" in page_title.lower():
+                    return {"title": "Защита от ботов", "price": 0, "image_url": "", "url": clean_url, "success": False}
                 try:
-                    await page.wait_for_selector("h1, [data-widget='webPrice'], .price-block__final-price", timeout=10000)
+                    await page.wait_for_selector("h1", timeout=15000)
                 except: pass
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 data = await page.evaluate("""() => {
                     const getMeta = (name) => document.querySelector(`meta[property="${name}"], meta[name="${name}"]`)?.content;
                     const title = document.querySelector('h1')?.innerText || document.title;
@@ -158,23 +170,11 @@ async def scrape_url(url: str):
                 if image:
                     if image.startswith('//'): image = 'https:' + image
                     if 'wbbasket.ru' in image: image = re.sub(r'/(tm|c246x328|c516x688|minor)/', '/big/', image)
-                return {"title": clean_title or "Товар", "price": price, "image_url": image, "url": url, "success": bool(clean_title)}
-            except Exception: return {"title": "Ошибка", "price": 0, "image_url": "", "url": url, "success": False}
+                return {"title": clean_title or "Товар", "price": price, "image_url": image, "url": clean_url, "success": bool(clean_title)}
+            except Exception: return {"title": "Ошибка", "price": 0, "image_url": "", "url": clean_url, "success": False}
             finally:
                 if browser: await browser.close()
-    except Exception: return {"title": "Ошибка", "price": 0, "image_url": "", "url": url, "success": False}
-
-async def get_browser_page(playwright):
-    browser = await playwright.chromium.launch(headless=True)
-    context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={'width': 1280, 'height': 720})
-    page = await context.new_page()
-    await stealth_async(page)
-    async def block_aggressively(route):
-        if route.request.resource_type in ["image", "media", "font"] and not ("wbbasket" in route.request.url or "ozone" in route.request.url): await route.abort()
-        elif any(domain in route.request.url for domain in ["google-analytics", "yandex.ru", "doubleclick", "facebook"]): await route.abort()
-        else: await route.continue_()
-    await page.route("**/*", block_aggressively)
-    return browser, page
+    except Exception: return {"title": "Ошибка", "price": 0, "image_url": "", "url": clean_url, "success": False}
 
 @router.post("/", response_model=WishlistResponse)
 async def create_wishlist(wishlist_data: WishlistCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -210,11 +210,18 @@ async def get_friends_wishlists(db: AsyncSession = Depends(get_db), current_user
     return [await format_wishlist_response(w, db, current_user.id) for w in result.scalars().all()]
 
 @router.get("/public/{slug}", response_model=WishlistResponse)
-async def get_public_wishlist(slug: str, db: AsyncSession = Depends(get_db)):
+async def get_public_wishlist(slug: str, db: AsyncSession = Depends(get_db), authorization: Optional[str] = Header(None)):
+    current_user_id = None
+    if authorization:
+        try:
+            from ...core.auth import get_current_user_from_token
+            user = await get_current_user_from_token(authorization, db)
+            if user: current_user_id = user.id
+        except: pass
     result = await db.execute(select(Wishlist).where(Wishlist.public_slug == slug))
     wishlist = result.scalar_one_or_none()
     if not wishlist: raise HTTPException(status_code=404, detail="Not found")
-    return await format_wishlist_response(wishlist, db)
+    return await format_wishlist_response(wishlist, db, current_user_id)
 
 @router.get("/{wishlist_id}", response_model=WishlistResponse)
 async def get_wishlist(wishlist_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -270,17 +277,10 @@ async def delete_gift(gift_id: int, db: AsyncSession = Depends(get_db), current_
     result = await db.execute(select(Gift).where(Gift.id == gift_id))
     gift = result.scalar_one_or_none()
     if not gift: raise HTTPException(status_code=404, detail="Not found")
-    
     wl = await db.get(Wishlist, gift.wishlist_id)
     if wl.owner_id != current_user.id: raise HTTPException(status_code=403, detail="Forbidden")
-    
-    # PRODUCT DECISION: Prevent deleting gifts with active contributions
     if gift.collected_amount > 0:
-        raise HTTPException(
-            status_code=400, 
-            detail="Нельзя удалить подарок, на который уже начали собирать средства. Свяжитесь с друзьями напрямую."
-        )
-        
+        raise HTTPException(status_code=400, detail="Нельзя удалить подарок со сборами")
     await db.delete(gift)
     await db.commit()
     return {"status": "deleted"}
@@ -301,21 +301,13 @@ async def reserve_gift(gift_id: int, data: ReserveGiftRequest, db: AsyncSession 
 async def add_contribution(gift_id: int, data: ContributionCreate, db: AsyncSession = Depends(get_db)):
     gift = await db.get(Gift, gift_id)
     if not gift: raise HTTPException(status_code=404)
-    
-    # EDGE CASE: Over-contribution protection
     remaining = gift.price - gift.collected_amount
-    if gift.price > 0 and data.amount > (remaining + 0.01): # +0.01 for float precision
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Сумма взноса превышает остаток. Осталось собрать всего {remaining}₽"
-        )
-        
+    if gift.price > 0 and data.amount > (remaining + 0.01):
+        raise HTTPException(status_code=400, detail=f"Сумма превышает остаток {remaining}₽")
     contrib = Contribution(gift_id=gift_id, amount=data.amount, contributor_email=data.contributor_email)
     db.add(contrib)
     gift.collected_amount += data.amount
-    if gift.collected_amount >= (gift.price - 0.01): 
-        gift.is_reserved = True
-        
+    if gift.collected_amount >= (gift.price - 0.01): gift.is_reserved = True
     await db.commit()
     wl = await db.get(Wishlist, gift.wishlist_id)
     await emit_wishlist_update(wl.public_slug, {"type": "contribution_added", "gift_id": gift_id, "is_complete": gift.is_reserved})

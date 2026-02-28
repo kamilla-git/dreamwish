@@ -32,6 +32,23 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+async def get_current_user_from_token(token_string: str, db: AsyncSession):
+    """Вспомогательная функция для получения юзера из сырой строки токена (Bearer ...)"""
+    if not token_string or not token_string.startswith("Bearer "):
+        return None
+    
+    token = token_string.split(" ")[1]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None: return None
+        
+        from ..models.wishlist import User
+        result = await db.execute(select(User).where(User.email == email))
+        return result.scalar_one_or_none()
+    except:
+        return None
+
 def get_current_user_dependency():
     """Фабрика для создания зависимости get_current_user"""
     from .database import get_db

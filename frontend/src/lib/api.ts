@@ -1,4 +1,6 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+let BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+if (BASE_URL.endsWith('/')) BASE_URL = BASE_URL.slice(0, -1);
+const API_URL = BASE_URL;
 
 const fetchWithTimeout = async (url: string, options: any = {}, timeout = 10000) => {
   const controller = new AbortController();
@@ -32,7 +34,13 @@ const handleResponse = async (res: Response) => {
     let errorDetail = 'Произошла ошибка при запросе к серверу';
     try {
       const errorData = await res.json();
-      errorDetail = errorData.detail || errorDetail;
+      if (typeof errorData.detail === 'string') {
+        errorDetail = errorData.detail;
+      } else if (Array.isArray(errorData.detail)) {
+        errorDetail = errorData.detail.map((e: any) => `${e.loc.join('.')}: ${e.msg}`).join(', ');
+      } else if (errorData.detail) {
+        errorDetail = JSON.stringify(errorData.detail);
+      }
     } catch (e) {}
     throw new Error(errorDetail);
   }
@@ -213,7 +221,9 @@ export const api = {
   },
 
   getPublicWishlist: async (slug: string): Promise<Wishlist> => {
-    const res = await fetchWithTimeout(`${API_URL}/wishlists/public/${slug}`);
+    const res = await fetchWithTimeout(`${API_URL}/wishlists/public/${slug}`, {
+      headers: getAuthHeaders()
+    });
     return handleResponse(res);
   },
 
