@@ -1,31 +1,19 @@
-FROM python:3.11-slim
-
-# Установка системных зависимостей для Playwright
-RUN apt-get update && apt-get install -y \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libxcomposite1 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
-    libpangocairo-1.0-0 \
-    libadwaita-1-0 \
-    && rm -rf /var/lib/apt/lists/*
+FROM mcr.microsoft.com/playwright/python:v1.42.0-jammy
 
 WORKDIR /app
 
-# Копируем зависимости
+# Копируем только требования для кэширования слоев
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Установка браузера Chromium
-RUN playwright install chromium
 
 # Копируем весь код бэкенда
 COPY . .
 
 # Создаем папку для загрузок
-RUN mkdir -p uploads
+RUN mkdir -p uploads && chmod 777 uploads
 
-# Запуск приложения через uvicorn
+# Указываем порт по умолчанию (Render сам подставит нужный)
+ENV PORT=10000
+
+# Запуск через uvicorn
 CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT
