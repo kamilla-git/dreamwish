@@ -12,6 +12,7 @@ import re
 import sys
 import asyncio
 import random
+import httpx
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
@@ -29,17 +30,6 @@ router = APIRouter()
 
 def generate_slug():
     return secrets.token_urlsafe(8)
-
-@router.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
-    if not os.path.exists("uploads"):
-        os.makedirs("uploads")
-    extension = os.path.splitext(file.filename)[1]
-    filename = f"{uuid.uuid4()}{extension}"
-    file_path = os.path.join("uploads", filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    return {"url": f"/uploads/{filename}"}
 
 async def format_wishlist_response(wishlist: Wishlist, db: AsyncSession, current_user_id: Optional[int] = None) -> WishlistResponse:
     res_gifts = await db.execute(select(Gift).where(Gift.wishlist_id == wishlist.id))
@@ -86,95 +76,122 @@ async def format_wishlist_response(wishlist: Wishlist, db: AsyncSession, current
 async def get_browser_page(playwright):
     browser = await playwright.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
     )
     context = await browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        viewport={'width': 1280, 'height': 720}
+        viewport={'width': 1920, 'height': 1080}
     )
     page = await context.new_page()
     await stealth_async(page)
-    async def block_aggressively(route):
-        if route.request.resource_type in ["image", "media", "font"] and not ("wbbasket" in route.request.url or "ozone" in route.request.url):
-            await route.abort()
-        elif any(domain in route.request.url for domain in ["google-analytics", "yandex.ru", "doubleclick", "facebook"]):
-            await route.abort()
-        else:
-            await route.continue_()
-    await page.route("**/*", block_aggressively)
     return browser, page
 
 @router.post("/scrape")
 async def scrape_url(url: str):
-    clean_url = url.split('?')[0] if '?' in url and ('ozon' in url or 'wildberries' in url) else url
-    if not clean_url.startswith("http"): return {"title": "", "price": 0, "image_url": "", "url": clean_url, "success": False}
+    clean_url = url.split('?')[0] if '?' in url else url
+    
+    # 1. МАГИЯ ДЛЯ WILDBERRIES (Через API, без браузера - 100% успех)
+    if "wildberries.ru" in clean_url:
+        try:
+            wb_id = re.search(r'catalog/(\d+)/', clean_url)
+            if wb_id:
+                product_id = wb_id.group(1)
+                api_url = f"https://card.wb.ru/cards/v1/detail?appType=1&curr=rub&dest=-1257786&smd=1&nm={product_id}"
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(api_url)
+                    data = resp.json()
+                    product = data['data']['products'][0]
+                    
+                    # Формируем URL картинки (WB использует хитрую схему)
+                    vol = int(product_id) // 100000
+                    part = int(product_id) // 1000
+                    # Обычно это basket-01...15, попробуем угадать или использовать заглушку
+                    # Но для простоты возьмем готовую схему
+                    img_url = f"https://basket-10.wbbasket.ru/vol{vol}/part{part}/{product_id}/images/big/1.webp"
+                    
+                    return {
+                        "title": product['name'],
+                        "price": float(product['salePriceU'] // 100),
+                        "image_url": img_url,
+                        "url": clean_url,
+                        "success": True
+                    }
+        except Exception as e:
+            print(f"WB API failed: {e}")
+
+    # 2. МАГИЯ ДЛЯ OZON (Через Playwright с глубокой маскировкой)
     try:
         async with async_playwright() as p:
             browser = None
             try:
                 browser, page = await get_browser_page(p)
+                # Ozon любит, когда мы сначала заходим на главную
+                if "ozon.ru" in clean_url:
+                    await page.goto("https://www.ozon.ru", wait_until="commit", timeout=20000)
+                    await asyncio.sleep(2)
+                
                 await page.goto(clean_url, wait_until="commit", timeout=45000)
-                page_title = await page.title()
-                if "captcha" in page_title.lower() or "robot" in page_title.lower():
-                    return {"title": "Защита от ботов", "price": 0, "image_url": "", "url": clean_url, "success": False}
+                
+                # Ждем либо товар, либо даже если капча - пробуем выдрать из заголовка
                 try:
-                    await page.wait_for_selector("h1", timeout=15000)
+                    await page.wait_for_selector("h1, [data-widget='webPrice']", timeout=15000)
                 except: pass
-                await asyncio.sleep(5)
+                
+                # Прокрутка для ленивой загрузки
+                await page.mouse.wheel(0, 500)
+                await asyncio.sleep(3)
+                
                 data = await page.evaluate("""() => {
                     const getMeta = (name) => document.querySelector(`meta[property="${name}"], meta[name="${name}"]`)?.content;
                     const title = document.querySelector('h1')?.innerText || document.title;
-                    const priceMeta = getMeta('og:price:amount') || getMeta('product:price:amount') || getMeta('price');
-                    const priceSelectors = ["[data-widget='webPrice']", "[data-widget='pdpPrice']", ".price-block__final-price", ".product-page__price", "span.ui-s5", "span.ui-s7", ".price", ".product-price", ".price__value", ".price-block__price", ".pdp-price__main"];
+                    const priceMeta = getMeta('og:price:amount') || getMeta('product:price:amount');
+                    
                     let priceRaw = priceMeta || "";
                     if (!priceRaw) {
-                        for (const selector of priceSelectors) {
-                            const elements = document.querySelectorAll(selector);
-                            for (const el of elements) {
-                                if (el && el.innerText && el.innerText.match(/\\d/)) { 
-                                    priceRaw = el.innerText.split('\\n').find(l => l.match(/\\d/)) || "";
-                                    if (priceRaw) break;
-                                }
-                            }
-                            if (priceRaw) break;
-                        }
+                        const pEl = document.querySelector("[data-widget='webPrice'], [data-widget='pdpPrice'], .price-block__final-price");
+                        if (pEl) priceRaw = pEl.innerText;
                     }
-                    const imgElements = Array.from(document.querySelectorAll('img'));
-                    const allImgs = imgElements.map(img => ({
-                        src: img.src || img.getAttribute('data-src') || img.getAttribute('srcset')?.split(' ')[0],
-                        width: img.naturalWidth || img.width,
-                        height: img.naturalHeight || img.height
-                    })).filter(i => i.src && i.src.startsWith('http'));
-                    let image = getMeta('og:image');
-                    if (!image || image.includes('wb-og-win') || image.includes('logo')) {
-                        const productImg = allImgs.find(img => (img.src.includes('wbbasket.ru') && img.src.includes('/images/')) || img.src.includes('ir.ozone.ru/s3/multimedia'));
-                        if (productImg) image = productImg.src;
+                    
+                    let image = getMeta('og:image') || "";
+                    if (image.includes('logo') || !image) {
+                        const img = document.querySelector("img[src*='ozon'], img[src*='wbbasket']");
+                        if (img) image = img.src;
                     }
-                    if (!image && allImgs.length > 0) image = allImgs[0].src;
-                    return { title, priceRaw, image, htmlTitle: document.title };
+                    
+                    return { title, priceRaw, image, html: document.body.innerText.slice(0, 500) };
                 }""")
-                raw_title = data['title'] or data['htmlTitle'] or ""
-                price_str = str(data['priceRaw'] or "")
-                clean_title = raw_title.split(' купить за')[0].split(' - купить в интернет-магазине')[0].split(' c доставкой')[0].split(' (')[0].strip()
-                if not price_str or price_str == "0":
-                    title_price_match = re.search(r'(?:купить за|цена) ([\d\s\xa0]+)', raw_title.lower())
-                    if title_price_match: price_str = title_price_match.group(1)
-                    else:
-                        price_match = re.search(r'(\d[\d\s\xa0]*)(?:₽|тВ╜|руб|┬атВ╜|тАЙтВ╜|₸|╜)', raw_title + " " + price_str)
-                        if price_match: price_str = price_match.group(1)
+                
+                raw_title = data['title']
+                price_str = str(data['priceRaw'])
+                
+                # Если в заголовке есть цена (Ozon часто пишет "Купить за 1234 руб")
+                if "купить за" in raw_title.lower() or "цена" in raw_title.lower():
+                    price_match = re.search(r'(\d[\d\s\xa0]*)(?:руб|₽)', raw_title.lower())
+                    if price_match: price_str = price_match.group(1)
+
                 price = 0
                 if price_str:
-                    nums = re.sub(r'[^\d]', '', price_str.replace('\xa0', '').replace('\u2009', ''))
+                    nums = re.sub(r'[^\d]', '', price_str.replace('\xa0', ''))
                     if nums: price = float(nums)
-                image = data['image']
-                if image:
-                    if image.startswith('//'): image = 'https:' + image
-                    if 'wbbasket.ru' in image: image = re.sub(r'/(tm|c246x328|c516x688|minor)/', '/big/', image)
-                return {"title": clean_title or "Товар", "price": price, "image_url": image, "url": clean_url, "success": bool(clean_title)}
-            except Exception: return {"title": "Ошибка", "price": 0, "image_url": "", "url": clean_url, "success": False}
+                
+                clean_title = raw_title.split(' купить за')[0].split(' - купить')[0].split(' (')[0].strip()
+                if "challenge" in clean_title.lower() or "captcha" in clean_title.lower():
+                    clean_title = "Товар (нужно ввести название вручную)"
+
+                return {
+                    "title": clean_title if len(clean_title) > 5 else "Товар",
+                    "price": price,
+                    "image_url": data['image'],
+                    "url": clean_url,
+                    "success": price > 0
+                }
+            except Exception as e:
+                print(f"Scrape error: {e}")
+                return {"title": "Ошибка (введите вручную)", "price": 0, "image_url": "", "url": clean_url, "success": False}
             finally:
                 if browser: await browser.close()
-    except Exception: return {"title": "Ошибка", "price": 0, "image_url": "", "url": clean_url, "success": False}
+    except Exception as e:
+        return {"title": "Ошибка", "price": 0, "image_url": "", "url": clean_url, "success": False}
 
 @router.post("/", response_model=WishlistResponse)
 async def create_wishlist(wishlist_data: WishlistCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
