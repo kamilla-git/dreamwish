@@ -15,6 +15,13 @@ export default function Register() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      toast.error('Введите корректный Email (например, magic@forest.com)');
+      return;
+    }
+
     if (password.length < 6) {
       toast.error('Пароль должен быть от 6 символов');
       return;
